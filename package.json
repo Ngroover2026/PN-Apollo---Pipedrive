@@ -1,0 +1,9 @@
+{
+  "name": "apollo-pipedrive-webhook",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Vercel serverless webhook that syncs an Apollo.io sequence reply into Pipedrive (find/create person, find/create deal, move it to the Replied stage, log a follow-up activity).",
+  "engines": {
+    "node": ">=18"
+  }
+}

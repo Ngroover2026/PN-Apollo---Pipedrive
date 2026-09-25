@@ -1,0 +1,7 @@
+{
+  "functions": {
+    "api/apollo-reply.js": {
+      "maxDuration": 10
+    }
+  }
+}
