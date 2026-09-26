@@ -71,9 +71,22 @@ async function createPerson({ email, name }) {
 }
 
 async function findOpenDealForPerson(personId) {
-  const res = await fetch(pipedriveUrl("/deals", { person_id: personId, status: "open" }));
+  // IMPORTANT: Pipedrive's v1 `/deals` list endpoint does NOT support filtering by person_id —
+  // passing it silently gets ignored and Pipedrive returns its default deal list instead, which
+  // previously caused this to grab and modify an unrelated, real deal. The correct endpoint for
+  // "deals belonging to this person" is /v1/persons/{id}/deals.
+  const res = await fetch(pipedriveUrl(`/persons/${personId}/deals`, { status: "open" }));
   const data = await res.json();
-  return data?.data?.[0] || null;
+  const deals = data?.data || [];
+
+  // Belt-and-suspenders: only ever act on a deal that is genuinely linked to this exact person,
+  // never just "whatever came back first" from an API response.
+  return (
+    deals.find((d) => {
+      const linkedPersonId = typeof d.person_id === "object" ? d.person_id?.value : d.person_id;
+      return String(linkedPersonId) === String(personId);
+    }) || null
+  );
 }
 
 async function createDeal({ personId, title }) {
