@@ -6,7 +6,7 @@
 // than creating a duplicate one), so someone reviews it before it becomes a full pipeline Deal.
 //
 // Deploy target: Vercel serverless function (Node 18+, no extra dependencies needed — uses the
-// built-in fetch). See ../README.md for step-by-step deploy + Apollo/Pipedrive setup instructions.
+// built-in fetch).
 
 const REQUIRED_ENV = [
   "PIPEDRIVE_DOMAIN", // e.g. "microgridpower" if your Pipedrive URL is microgridpower.pipedrive.com
@@ -52,7 +52,13 @@ function extractContact(body) {
     body?.contact?.phone ||
     undefined;
 
-  return { email, name, company, mobile };
+  // NEW: which Pipedrive user should own the resulting Person/Lead. Each Apollo Workflow now sends
+  // its own owner_id in the webhook body (Paul's workflow sends his, Mike's workflow sends his),
+  // so replies land in the right person's Leads Inbox instead of always defaulting to whoever the
+  // API token belongs to.
+  const ownerId = body.owner_id || undefined;
+
+  return { email, name, company, mobile, ownerId };
 }
 
 async function findPersonByEmail(email) {
@@ -71,12 +77,13 @@ async function findPersonByEmail(email) {
   return fullData?.data || item;
 }
 
-async function createPerson({ email, name, mobile }) {
+async function createPerson({ email, name, mobile, ownerId }) {
   const body = {
     name: name || email,
     email: [{ value: email, primary: true }],
   };
   if (mobile) body.phone = [{ value: mobile, primary: true, label: "mobile" }];
+  if (ownerId) body.owner_id = ownerId; // NEW
 
   const res = await fetch(pipedriveUrl("/persons"), {
     method: "POST",
@@ -103,10 +110,11 @@ async function updatePersonMobileIfMissing(personId, mobile, existingPhone) {
 }
 
 async function findOpenLeadForPerson(personId) {
-  // Pipedrive's /v1/leads list endpoint does accept a person_id filter, but given the earlier
-  // /deals endpoint silently ignored an equivalent filter and caused a real record to get modified
-  // by mistake, we don't trust the filter alone here either — every result is re-checked below to
-  // confirm it's genuinely linked to this exact person before we ever act on it.
+  // Pipedrive's /v1/leads list endpoint does accept a person_id filter, but an earlier version of
+  // this integration (using /deals) found that an equivalent filter could silently return an
+  // unrelated record and cause it to get modified by mistake. So we don't trust the filter alone
+  // here either — every result is re-checked below to confirm it's genuinely linked to this exact
+  // person before we ever act on it.
   const res = await fetch(pipedriveUrl("/leads", { person_id: personId }));
   const data = await res.json();
   const leads = data?.data || [];
@@ -120,20 +128,23 @@ async function findOpenLeadForPerson(personId) {
   );
 }
 
-async function createLead({ personId, title }) {
+async function createLead({ personId, title, ownerId }) {
+  const body = {
+    title: title || "Replied — new lead",
+    person_id: personId,
+  };
+  if (ownerId) body.owner_id = ownerId; // NEW
+
   const res = await fetch(pipedriveUrl("/leads"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      title: title || "Replied — new lead",
-      person_id: personId,
-    }),
+    body: JSON.stringify(body),
   });
   const data = await res.json();
   return data?.data || null;
 }
 
-async function createFollowUpActivity({ personId, leadId, subject }) {
+async function createFollowUpActivity({ personId, leadId, subject, ownerId }) {
   const today = new Date().toISOString().slice(0, 10);
   const body = {
     subject: subject || "Follow up on Apollo reply",
@@ -142,6 +153,7 @@ async function createFollowUpActivity({ personId, leadId, subject }) {
     person_id: personId,
   };
   if (leadId) body.lead_id = leadId;
+  if (ownerId) body.user_id = ownerId; // NEW — activities use "user_id" for the assigned owner
 
   await fetch(pipedriveUrl("/activities"), {
     method: "POST",
@@ -169,7 +181,7 @@ module.exports = async (req, res) => {
   }
 
   try {
-    const { email, name, company, mobile } = extractContact(req.body || {});
+    const { email, name, company, mobile, ownerId } = extractContact(req.body || {});
     if (!email) {
       res.status(400).json({ ok: false, error: "No contact email found in payload", received: req.body });
       return;
@@ -177,7 +189,7 @@ module.exports = async (req, res) => {
 
     let person = await findPersonByEmail(email);
     if (!person) {
-      person = await createPerson({ email, name, mobile });
+      person = await createPerson({ email, name, mobile, ownerId });
     } else {
       // Existing person: only fill in the mobile number if they don't already have one on file.
       await updatePersonMobileIfMissing(person.id, mobile, person.phone);
@@ -190,7 +202,11 @@ module.exports = async (req, res) => {
     let lead = await findOpenLeadForPerson(person.id);
     let leadAction = "reused_existing";
     if (!lead) {
-      lead = await createLead({ personId: person.id, title: `${name || email}${company ? " — " + company : ""}` });
+      lead = await createLead({
+        personId: person.id,
+        title: `${name || email}${company ? " — " + company : ""}`,
+        ownerId,
+      });
       leadAction = "created";
     }
 
@@ -198,6 +214,7 @@ module.exports = async (req, res) => {
       personId: person.id,
       leadId: lead?.id,
       subject: `${name || email} replied — follow up`,
+      ownerId,
     });
 
     res.status(200).json({
