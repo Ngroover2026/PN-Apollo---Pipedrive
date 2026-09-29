@@ -5,13 +5,50 @@
 // Inbox for it (or logs a follow-up activity against an existing open Lead for that person, rather
 // than creating a duplicate one), so someone reviews it before it becomes a full pipeline Deal.
 //
+// Safety filter: if the reply text looks like an opt-out / do-not-contact / out-of-office / wrong-
+// person reply, we still record the Person (for a paper trail) but we do NOT create a Lead or book
+// a follow-up call — instead we log a note on the Person explaining why it was skipped. This is a
+// basic keyword filter, not sentiment analysis - if you can get Apollo's own reply-sentiment
+// classification into the webhook body (a merge tag such as {{reply.sentiment}}, if your Workflow
+// exposes one), that will be much more reliable than string matching and this filter can defer to it.
+//
 // Deploy target: Vercel serverless function (Node 18+, no extra dependencies needed — uses the
 // built-in fetch).
 
 const REQUIRED_ENV = [
-  "PIPEDRIVE_DOMAIN", // e.g. "microgridpower" if your Pipedrive URL is microgridpower.pipedrive.com
+  "PIPEDRIVE_DOMAIN",
   "PIPEDRIVE_API_TOKEN",
-  "WEBHOOK_SECRET", // a password you invent; Apollo sends it back as a header so randoms can't hit this URL
+  "WEBHOOK_SECRET",
+];
+
+// Basic keyword filter for opt-out / do-not-contact / not-a-fit replies.
+// Not exhaustive, and not a substitute for real sentiment classification - just a safety net so an
+// obvious "remove me" or "wrong person" reply doesn't automatically generate a same-day call task.
+const DNC_KEYWORDS = [
+  "unsubscribe",
+  "remove me",
+  "remove my",
+  "take me off",
+  "do not contact",
+  "don't contact",
+  "do not email",
+  "don't email",
+  "do not call",
+  "don't call",
+  "stop emailing",
+  "stop contacting",
+  "opt out",
+  "opt-out",
+  "not interested",
+  "no longer interested",
+  "wrong person",
+  "wrong contact",
+  "out of office",
+  "automatic reply",
+  "auto-reply",
+  "auto reply",
+  "no longer with",
+  "no longer at",
 ];
 
 function pipedriveUrl(path, query = {}) {
@@ -20,9 +57,22 @@ function pipedriveUrl(path, query = {}) {
   return `${base}?${params.toString()}`;
 }
 
-// Apollo's webhook payload shape can vary depending on which fields you map in the workflow builder.
-// This pulls the contact's email out of whichever shape shows up so the integration doesn't break
-// if Apollo changes the exact field names later.
+// Throws if the Pipedrive response isn't ok, so a failed call can never silently look like success.
+async function pipedriveFetch(path, options, query = {}) {
+  const res = await fetch(pipedriveUrl(path, query), options);
+  let data;
+  try {
+    data = await res.json();
+  } catch (err) {
+    throw new Error(`Pipedrive request to ${path} returned non-JSON response (status ${res.status})`);
+  }
+  if (!res.ok || data?.success === false) {
+    const message = data?.error || data?.error_info || `HTTP ${res.status}`;
+    throw new Error(`Pipedrive request to ${path} failed: ${message}`);
+  }
+  return data;
+}
+
 function extractContact(body) {
   const email =
     body.email ||
@@ -52,28 +102,58 @@ function extractContact(body) {
     body?.contact?.phone ||
     undefined;
 
-  // NEW: which Pipedrive user should own the resulting Person/Lead. Each Apollo Workflow now sends
-  // its own owner_id in the webhook body (Paul's workflow sends his, Mike's workflow sends his),
-  // so replies land in the right person's Leads Inbox instead of always defaulting to whoever the
-  // API token belongs to.
+  // Which Pipedrive user should own the resulting Person/Lead.
   const ownerId = body.owner_id || undefined;
 
-  return { email, name, company, mobile, ownerId };
+  // Best-effort: pull the actual reply text if the Apollo Workflow webhook body includes it.
+  // Apollo doesn't have one fixed field name for this across accounts, so we check several
+  // likely spots. If your Workflow's merge-tag picker exposes a reply-body or reply-sentiment
+  // tag, add it to the webhook JSON body under one of these keys (or add a new one below).
+  const replyText =
+    body.reply_body ||
+    body.reply_text ||
+    body.email_body ||
+    body.message ||
+    body?.reply?.body ||
+    body?.contact?.last_reply_body ||
+    undefined;
+
+  const replySentiment = body.reply_sentiment || body?.reply?.sentiment || undefined;
+
+  return { email, name, company, mobile, ownerId, replyText, replySentiment };
+}
+
+// Returns { flagged: boolean, reason: string|null }
+function checkDoNotContact({ replyText, replySentiment }) {
+  if (replySentiment) {
+    const sentiment = String(replySentiment).toLowerCase();
+    const negative = ["not_interested", "not interested", "unsubscribe", "do_not_contact", "do not contact", "ooo", "out_of_office"];
+    if (negative.some((s) => sentiment.includes(s))) {
+      return { flagged: true, reason: `Apollo reply sentiment: "${replySentiment}"` };
+    }
+  }
+
+  if (replyText) {
+    const lower = String(replyText).toLowerCase();
+    const hit = DNC_KEYWORDS.find((kw) => lower.includes(kw));
+    if (hit) {
+      return { flagged: true, reason: `Reply text matched keyword: "${hit}"` };
+    }
+  }
+
+  return { flagged: false, reason: null };
 }
 
 async function findPersonByEmail(email) {
-  const res = await fetch(
-    pipedriveUrl("/persons/search", { term: email, fields: "email", exact_match: "true" })
-  );
-  const data = await res.json();
+  const data = await pipedriveFetch("/persons/search", undefined, {
+    term: email,
+    fields: "email",
+    exact_match: "true",
+  });
   const item = data?.data?.items?.[0]?.item;
   if (!item) return null;
 
-  // The /persons/search "item" is a stripped-down summary that doesn't reliably include the
-  // full phone array, so fetch the complete record — needed to correctly tell whether this
-  // person already has a mobile number on file before we consider adding one.
-  const fullRes = await fetch(pipedriveUrl(`/persons/${item.id}`));
-  const fullData = await fullRes.json();
+  const fullData = await pipedriveFetch(`/persons/${item.id}`);
   return fullData?.data || item;
 }
 
@@ -83,24 +163,21 @@ async function createPerson({ email, name, mobile, ownerId }) {
     email: [{ value: email, primary: true }],
   };
   if (mobile) body.phone = [{ value: mobile, primary: true, label: "mobile" }];
-  if (ownerId) body.owner_id = ownerId; // NEW
+  if (ownerId) body.owner_id = ownerId;
 
-  const res = await fetch(pipedriveUrl("/persons"), {
+  const data = await pipedriveFetch("/persons", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const data = await res.json();
   return data?.data || null;
 }
 
-// Only fills in the phone number if the person doesn't already have one on file —
-// never overwrites a number someone in Pipedrive may have already corrected/updated.
 async function updatePersonMobileIfMissing(personId, mobile, existingPhone) {
   const hasPhone = Array.isArray(existingPhone) && existingPhone.some((p) => p?.value);
   if (hasPhone || !mobile) return;
 
-  await fetch(pipedriveUrl(`/persons/${personId}`), {
+  await pipedriveFetch(`/persons/${personId}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -109,19 +186,24 @@ async function updatePersonMobileIfMissing(personId, mobile, existingPhone) {
   });
 }
 
+async function addNoteToPerson(personId, content) {
+  await pipedriveFetch("/notes", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      content,
+      person_id: personId,
+    }),
+  });
+}
+
 async function findOpenLeadForPerson(personId) {
-  // Pipedrive's /v1/leads list endpoint does accept a person_id filter, but an earlier version of
-  // this integration (using /deals) found that an equivalent filter could silently return an
-  // unrelated record and cause it to get modified by mistake. So we don't trust the filter alone
-  // here either — every result is re-checked below to confirm it's genuinely linked to this exact
-  // person before we ever act on it.
-  const res = await fetch(pipedriveUrl("/leads", { person_id: personId }));
-  const data = await res.json();
+  const data = await pipedriveFetch("/leads", undefined, { person_id: personId });
   const leads = data?.data || [];
 
   return (
     leads.find((l) => {
-      if (l.is_archived) return false; // don't reuse a lead that's already been actioned/archived
+      if (l.is_archived) return false;
       const linkedPersonId = typeof l.person_id === "object" ? l.person_id?.value : l.person_id;
       return String(linkedPersonId) === String(personId);
     }) || null
@@ -133,14 +215,13 @@ async function createLead({ personId, title, ownerId }) {
     title: title || "Replied — new lead",
     person_id: personId,
   };
-  if (ownerId) body.owner_id = ownerId; // NEW
+  if (ownerId) body.owner_id = ownerId;
 
-  const res = await fetch(pipedriveUrl("/leads"), {
+  const data = await pipedriveFetch("/leads", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
-  const data = await res.json();
   return data?.data || null;
 }
 
@@ -153,9 +234,9 @@ async function createFollowUpActivity({ personId, leadId, subject, ownerId }) {
     person_id: personId,
   };
   if (leadId) body.lead_id = leadId;
-  if (ownerId) body.user_id = ownerId; // NEW — activities use "user_id" for the assigned owner
+  if (ownerId) body.user_id = ownerId;
 
-  await fetch(pipedriveUrl("/activities"), {
+  await pipedriveFetch("/activities", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
@@ -181,7 +262,7 @@ module.exports = async (req, res) => {
   }
 
   try {
-    const { email, name, company, mobile, ownerId } = extractContact(req.body || {});
+    const { email, name, company, mobile, ownerId, replyText, replySentiment } = extractContact(req.body || {});
     if (!email) {
       res.status(400).json({ ok: false, error: "No contact email found in payload", received: req.body });
       return;
@@ -191,11 +272,27 @@ module.exports = async (req, res) => {
     if (!person) {
       person = await createPerson({ email, name, mobile, ownerId });
     } else {
-      // Existing person: only fill in the mobile number if they don't already have one on file.
       await updatePersonMobileIfMissing(person.id, mobile, person.phone);
     }
     if (!person) {
       res.status(502).json({ ok: false, error: "Could not find or create a Pipedrive person" });
+      return;
+    }
+
+    const dnc = checkDoNotContact({ replyText, replySentiment });
+    if (dnc.flagged) {
+      await addNoteToPerson(
+        person.id,
+        `Apollo reply auto-sync skipped creating a Lead/follow-up call.\nReason: ${dnc.reason}\n` +
+          (replyText ? `Reply excerpt: "${String(replyText).slice(0, 300)}"` : "(no reply text available in webhook payload)")
+      );
+
+      res.status(200).json({
+        ok: true,
+        person_id: person.id,
+        lead_action: "skipped_do_not_contact",
+        reason: dnc.reason,
+      });
       return;
     }
 
@@ -224,6 +321,8 @@ module.exports = async (req, res) => {
       lead_action: leadAction,
     });
   } catch (err) {
-    res.status(500).json({ ok: false, error: String(err) });
+    // Any Pipedrive call that failed above throws, so we land here instead of silently
+    // reporting success with nothing actually created.
+    res.status(500).json({ ok: false, error: String(err?.message || err) });
   }
 };
